@@ -1,31 +1,32 @@
 # Component type version catalog.
-# Tracks supported ClickHouse releases.
+# Tracks supported Apache Kafka releases managed by the Strimzi operator.
 # Exactly one version per type must be marked `default: true`.
 #
-# Images: official ClickHouse Docker Hub image (clickhouse/clickhouse-server).
-# LTS releases are preferred for production; latest is available for testing.
+# metadataVersion: the Kafka metadata version used in KRaft mode.
+# Matches the Strimzi-supported metadataVersion for each Kafka release.
+# See: https://strimzi.io/docs/operators/latest/configuring.html#type-KafkaClusterSpec-reference
 
 componentTypes:
-  clickhouse:
+  kafka:
     versions:
-    - version: "25.3.5"
-      image: clickhouse/clickhouse-server:25.3.5
+    - version: "3.9.0"
+      image: quay.io/strimzi/kafka:0.44.0-kafka-3.9.0
       default: true
-    - version: "25.5.2"
-      image: clickhouse/clickhouse-server:25.5.2
-    - version: "24.8.14"
-      image: clickhouse/clickhouse-server:24.8.14
+    - version: "3.8.1"
+      image: quay.io/strimzi/kafka:0.44.0-kafka-3.8.1
+    - version: "3.7.2"
+      image: quay.io/strimzi/kafka:0.44.0-kafka-3.7.2
 
 # Version bundles: curated sets of compatible component versions.
 # Users set spec.version to a bundle name; the runtime resolves per-component versions.
 versions:
-- name: "25.3"
+- name: "3.9"
   default: true
   components:
-    engine: "25.3.5"
-- name: "25.5"
+    engine: "3.9.0"
+- name: "3.8"
   components:
-    engine: "25.5.2"
-- name: "24.8"
+    engine: "3.8.1"
+- name: "3.7"
   components:
-    engine: "24.8.14"
+    engine: "3.7.2"

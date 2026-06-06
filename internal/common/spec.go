@@ -4,42 +4,43 @@ package common
 const (
 	// ProviderName is the canonical name of this provider.
 	// Must match the Provider CR name registered in OpenEverest.
-	ProviderName = "provider-clickhouse"
+	ProviderName = "provider-kafka"
 
-	// ComponentEngine is the logical name of the ClickHouse engine component.
+	// ComponentEngine is the logical name of the Kafka engine component.
 	ComponentEngine = "engine"
 
-	// ComponentTypeClickHouse is the component type name, matching versions.yaml.
-	ComponentTypeClickHouse = "clickhouse"
+	// ComponentTypeKafka is the component type name, matching versions.yaml.
+	ComponentTypeKafka = "kafka"
 
-	// TopologyStandalone is the single-node topology name.
+	// TopologyStandalone is the single-broker topology name.
 	TopologyStandalone = "standalone"
 
-	// TopologyReplicated is the replicated topology name (requires ClickHouse Keeper).
+	// TopologyReplicated is the replicated topology name (3+ brokers, KRaft quorum).
 	TopologyReplicated = "replicated"
 
-	// CHIClusterName is the cluster name used inside the ClickHouseInstallation CR.
-	// Altinity uses this as part of the pod and service naming scheme.
-	CHIClusterName = "clickhouse"
+	// KafkaClusterName is the cluster name used inside the Kafka CR.
+	// Strimzi uses this as part of the pod and service naming scheme.
+	KafkaClusterName = "kafka"
 
-	// CHKClusterName is the cluster name used inside the ClickHouseKeeperInstallation CR.
-	CHKClusterName = "keeper"
+	// DefaultStandaloneReplicas is the broker count for the standalone topology.
+	DefaultStandaloneReplicas = 1
 
-	// KeeperReplicas is the number of Keeper nodes — must be odd for Raft quorum.
-	KeeperReplicas = 3
+	// DefaultReplicatedReplicas is the default broker count for the replicated topology.
+	// Minimum 3 for Raft quorum and replication factor safety.
+	DefaultReplicatedReplicas = 3
 
-	// DefaultReplicasCount is the default number of ClickHouse replicas for the replicated topology.
-	DefaultReplicasCount = 2
+	// BootstrapPort is the plain (non-TLS) Kafka client port exposed by Strimzi.
+	BootstrapPort = "9092"
 
-	// PodTemplateName is the name of the pod template defined in the CHI spec.
-	PodTemplateName = "default"
+	// KafkaMetadataVersion3_9 is the KRaft metadata version for Kafka 3.9.x.
+	KafkaMetadataVersion3_9 = "3.9-IV0"
 
-	// KeeperPodTemplateName is the name of the pod template for Keeper nodes.
-	KeeperPodTemplateName = "keeper-default"
+	// KafkaMetadataVersion3_8 is the KRaft metadata version for Kafka 3.8.x.
+	KafkaMetadataVersion3_8 = "3.8-IV0"
 
-	// DataVolumeClaimTemplateName is the name of the volume claim template for data storage.
-	DataVolumeClaimTemplateName = "data"
+	// KafkaMetadataVersion3_7 is the KRaft metadata version for Kafka 3.7.x.
+	KafkaMetadataVersion3_7 = "3.7-IV4"
 
-	// KeeperDataVolumeClaimTemplateName is the name of the volume claim template for Keeper storage.
-	KeeperDataVolumeClaimTemplateName = "keeper-data"
+	// DefaultMetadataVersion is used when the version-specific value is not resolved.
+	DefaultMetadataVersion = KafkaMetadataVersion3_9
 )

@@ -1,22 +1,26 @@
 // Package provider defines the provider implementation.
-// RBAC markers for the Altinity ClickHouse and ClickHouse Keeper operator resources.
+// RBAC markers for the Strimzi Kafka operator resources.
 package provider
 
-// Altinity ClickHouseInstallation
-// +kubebuilder:rbac:groups=clickhouse.altinity.com,resources=clickhouseinstallations,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=clickhouse.altinity.com,resources=clickhouseinstallations/status,verbs=get
-// +kubebuilder:rbac:groups=clickhouse.altinity.com,resources=clickhouseinstallations/finalizers,verbs=update
+// Strimzi Kafka cluster
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkas/status,verbs=get
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkas/finalizers,verbs=update
 
-// Altinity ClickHouseKeeperInstallation
-// +kubebuilder:rbac:groups=clickhouse-keeper.altinity.com,resources=clickhousekeeperinstallations,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=clickhouse-keeper.altinity.com,resources=clickhousekeeperinstallations/status,verbs=get
-// +kubebuilder:rbac:groups=clickhouse-keeper.altinity.com,resources=clickhousekeeperinstallations/finalizers,verbs=update
+// Strimzi KafkaNodePool (KRaft mode)
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkanodepools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkanodepools/status,verbs=get
 
-// Core Kubernetes resources managed by the Altinity operator on our behalf
+// Strimzi KafkaTopic and KafkaUser (managed by entity operator)
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkatopics,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kafka.strimzi.io,resources=kafkausers,verbs=get;list;watch
+
+// Core Kubernetes resources managed by the Strimzi operator on our behalf
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch

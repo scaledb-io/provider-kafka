@@ -8,7 +8,7 @@ import (
 
 	"github.com/openeverest/openeverest/v2/provider-runtime/reconciler"
 
-	"github.com/scaledb-io/provider-clickhouse/internal/provider"
+	"github.com/scaledb-io/provider-kafka/internal/provider"
 )
 
 // main is the entry point for the provider.

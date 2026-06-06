@@ -1,15 +1,31 @@
-# provider-clickhouse
+# provider-kafka
 
-An [OpenEverest](https://github.com/openeverest) provider.
+An [OpenEverest](https://github.com/openeverest) provider for Apache Kafka.
+
+Wraps the **[Strimzi Kafka Operator](https://strimzi.io)** and runs Kafka in **KRaft mode** (no ZooKeeper required).
+
+> **License:** Apache Kafka and the Strimzi operator are both Apache 2.0.
+> This provider is also Apache 2.0 — see [LICENSE](LICENSE).
 
 > **New to provider development?** See `github.com/openeverest/provider-sdk/blob/main/PROVIDER_DEVELOPMENT.md` for a complete guide.
+
+---
 
 ## Prerequisites
 
 - Go 1.26+
 - A Kubernetes cluster (k3d, kind, or remote)
-- [OpenEverest CRDs](https://github.com/openeverest/openeverest) installed
-- Your operator installed and running
+- [OpenEverest v2 CRDs](https://github.com/openeverest/openeverest) installed
+- [Strimzi Kafka Operator](https://strimzi.io/docs/operators/latest/deploying.html) installed
+
+### Install Strimzi
+
+```bash
+helm repo add strimzi https://charts.strimzi.io/index.yaml && helm repo update
+helm install strimzi strimzi/strimzi-kafka-operator --namespace strimzi --create-namespace
+```
+
+---
 
 ## Quick Start
 
@@ -24,95 +40,78 @@ make run
 make helm-install
 ```
 
-## Development
+---
 
-### Project Structure
+## Supported Versions
+
+| Kafka Version | Strimzi Image | Default |
+|--------------|---------------|---------|
+| 3.9.0 | `quay.io/strimzi/kafka:0.44.0-kafka-3.9.0` | ✅ |
+| 3.8.1 | `quay.io/strimzi/kafka:0.44.0-kafka-3.8.1` | |
+| 3.7.2 | `quay.io/strimzi/kafka:0.44.0-kafka-3.7.2` | |
+
+---
+
+## Topologies
+
+### `standalone`
+Single-broker Kafka cluster. KRaft mode, no ZooKeeper.
+Suitable for development and local testing. **Not recommended for production.**
+
+### `replicated`
+Multi-broker Kafka cluster. KRaft mode, minimum 3 brokers (Raft quorum).
+Replication factors and min.insync.replicas are set to 3 automatically.
+Suitable for production workloads requiring high availability.
+
+---
+
+## Architecture
+
+```
+OpenEverest Instance CR
+      ↓
+provider-kafka (this provider)
+      ↓  creates
+Strimzi Kafka CR (KRaft mode — no ZooKeeper)
+      ↓  managed by
+Strimzi Operator
+      ↓  provisions
+Kafka broker Pods + bootstrap Service
+```
+
+**KRaft mode** means the Kafka cluster manages its own metadata via the Raft consensus protocol. No external ZooKeeper cluster is required — all nodes participate in both broker and controller roles.
+
+### Connection
+
+Once ready, the Kafka bootstrap endpoint is:
+```
+<instance>-kafka-bootstrap.<namespace>.svc:9092
+```
+
+---
+
+## Project Structure
 
 ```
 cmd/provider/              # Entry point
 internal/
   provider/
     provider.go            # ProviderInterface implementation (Validate/Sync/Status/Cleanup)
-    rbac.go                # Kubebuilder RBAC markers
+    rbac.go                # Kubebuilder RBAC markers for Strimzi CRDs
   common/
     spec.go                # Component name constants
 definition/
   provider.yaml            # Provider name + component→type mapping
-  versions.yaml            # Component type version/image catalog
-  types.go                 # Shared Go types
-  components/
-    types.go               # Component custom spec types
+  versions.yaml            # Supported Kafka versions + Strimzi images
   topologies/
-    <topology>/
-      topology.yaml        # Topology config + UI schema
-      types.go             # Topology-specific config types
-config/
-  rbac/
-    role.yaml              # Generated ClusterRole (do not edit manually)
-charts/provider-clickhouse/     # Helm chart for deployment
-  generated/
-    rbac-rules.yaml        # Generated RBAC rules (do not edit manually)
-    provider-spec.yaml     # Generated Provider CR spec (do not edit manually)
-  templates/               # Helm templates
-examples/
-  instance-example.yaml    # Example Instance CR
-  instance-simple.yaml     # Minimal Instance CR
-dev/
-  k3d_config.yaml          # Local k3d cluster config
-hack/                      # Helper scripts
-gen.go                     # go:generate entry point
-Makefile                   # Build, generate, and deploy targets
-Dockerfile
+    standalone/            # Single-broker dev topology
+    replicated/            # 3-broker production topology (KRaft quorum)
 ```
 
-### Make Targets
+---
 
-| Target                  | Description                                                |
-|-------------------------|-------------------------------------------------------------|
-| `make generate`         | Run all code generation (RBAC + Helm sync + provider spec) |
-| `make run`              | Run the provider locally                                   |
-| `make build`            | Build the provider binary                                  |
-| `make docker-build`     | Build the container image                                  |
-| `make helm-install`     | Deploy with Helm                                           |
-| `make helm-template`    | Render Helm templates locally (dry-run)                    |
-| `make test`             | Run unit tests                                             |
-| `make test-integration` | Run kuttl integration tests                                |
-| `make verify`           | Check generated files are up-to-date (CI)                  |
-| `make lint`             | Run golangci-lint                                          |
+## Related Issues
 
-> For development patterns (RBAC, watches, code generation), see [PROVIDER_DEVELOPMENT.md](https://github.com/openeverest/provider-sdk/blob/main/PROVIDER_DEVELOPMENT.md).
-
-## Deployment
-
-### Helm
-
-```bash
-# Install
-helm install provider-clickhouse charts/provider-clickhouse/ --create-namespace
-
-# Upgrade
-helm upgrade provider-clickhouse charts/provider-clickhouse/
-
-# Uninstall
-helm uninstall provider-clickhouse
-```
-
-### Local Development
-
-```bash
-# Create a local k3d cluster
-make k3d-cluster-up
-
-# Run the provider locally against the cluster
-make run
-
-# Run integration tests
-make test-integration
-
-# Tear down the cluster
-make k3d-cluster-down
-```
-
-## License
-
-Apache License 2.0 — see [LICENSE](LICENSE) for details.
+- [openeverest/openeverest#2336](https://github.com/openeverest/openeverest/issues/2336) — Add support for Apache Kafka / Strimzi
+- [openeverest/openeverest#2337](https://github.com/openeverest/openeverest/issues/2337) — Kafka Connect cluster management
+- [openeverest/openeverest#2338](https://github.com/openeverest/openeverest/issues/2338) — Debezium CDC connector support

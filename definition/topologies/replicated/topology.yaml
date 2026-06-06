@@ -1,10 +1,7 @@
-# Replicated topology: multi-replica ClickHouse with ClickHouse Keeper.
-# ClickHouse Keeper (3 nodes, Raft quorum) replaces ZooKeeper — no external dependency.
+# Replicated topology: multi-broker Apache Kafka cluster (KRaft mode).
+# KRaft handles metadata natively — no ZooKeeper required.
+# Minimum 3 brokers for Raft quorum and replication factor safety.
 # Suitable for production workloads requiring high availability.
-#
-# Resources:
-#   engine   - ClickHouse replicas (configurable count, default 2)
-#   keeper   - 3 Keeper nodes are always provisioned automatically (not user-configurable)
 
 config:
   components:
@@ -12,15 +9,15 @@ config:
 
 ui:
   sections:
-    databaseVersion:
-      label: "Database Version"
-      description: "Select the ClickHouse version to deploy."
+    kafkaVersion:
+      label: "Kafka Version"
+      description: "Select the Apache Kafka version to deploy."
       components:
         version:
           uiType: select
           path: spec.version
           fieldParams:
-            label: "ClickHouse Version"
+            label: "Kafka Version"
             optionsPath: spec.versions
             optionsPathConfig:
               labelPath: "name"
@@ -33,25 +30,25 @@ ui:
 
     scaling:
       label: "Scaling"
-      description: "Number of ClickHouse replicas. Minimum 2 for HA."
+      description: "Number of Kafka brokers. Minimum 3 for HA (Raft quorum)."
       components:
         replicas:
           uiType: number
           path: spec.components.engine.replicas
           fieldParams:
-            label: "Replicas"
-            defaultValue: 2
+            label: "Brokers"
+            defaultValue: 3
             step: 1
             modes:
               edit:
                 disabled: true
           validation:
             required: true
-            min: 2
+            min: 3
 
     resources:
       label: "Resources"
-      description: "Compute resources and storage per ClickHouse replica."
+      description: "Compute resources and storage per Kafka broker."
       components:
         compute:
           uiType: group
@@ -72,7 +69,7 @@ ui:
               path: spec.components.engine.resources.limits.memory
               fieldParams:
                 label: "Memory"
-                defaultValue: 8
+                defaultValue: 4
                 step: 1
                 badge: "Gi"
                 badgeToApi: true
@@ -118,7 +115,7 @@ ui:
             provider: storageClasses
 
   sectionsOrder:
-    - databaseVersion
+    - kafkaVersion
     - scaling
     - resources
     - advanced

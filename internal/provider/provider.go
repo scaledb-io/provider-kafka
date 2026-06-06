@@ -15,26 +15,28 @@
 package provider
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
-	chiv1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
-	chkv1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
-	corev1 "k8s.io/api/core/v1"
+	kafkav1beta2 "github.com/RedHatInsights/strimzi-client-go/apis/kafka.strimzi.io/v1beta2"
 	"k8s.io/apimachinery/pkg/api/resource"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	corev1alpha1 "github.com/openeverest/openeverest/v2/api/core/v1alpha1"
 	"github.com/openeverest/openeverest/v2/provider-runtime/controller"
 
-	"github.com/scaledb-io/provider-clickhouse/internal/common"
+	"github.com/scaledb-io/provider-kafka/internal/common"
 )
 
 // Compile-time check.
 var _ controller.ProviderInterface = (*Provider)(nil)
 
-// Provider implements controller.ProviderInterface for ClickHouse via the Altinity operator.
+// Provider implements controller.ProviderInterface for Apache Kafka via the Strimzi operator.
 type Provider struct {
 	controller.BaseProvider
 }
@@ -45,13 +47,12 @@ func New() *Provider {
 		BaseProvider: controller.BaseProvider{
 			ProviderName: common.ProviderName,
 			SchemeFuncs: []func(*runtime.Scheme) error{
-				chiv1.AddToScheme,
-				chkv1.AddToScheme,
+				kafkav1beta2.AddToScheme,
 			},
-			// NOTE: We intentionally do NOT watch CHI/CHK here.
+			// NOTE: We intentionally do NOT watch Kafka CRs here.
 			// Watching them causes a tight feedback loop: operator updates
 			// (finalizers, status) re-trigger Apply, which updates the object,
-			// which triggers the operator again.
+			// which triggers the Strimzi operator again.
 			// Instead, Status() polls via c.Get() on each Instance reconcile,
 			// and Sync() returns WaitError while provisioning is in progress.
 			WatchConfigs: []controller.WatchConfig{},
@@ -62,7 +63,7 @@ func New() *Provider {
 // Validate checks the Instance spec before reconciliation.
 func (p *Provider) Validate(c *controller.Context) error {
 	l := log.FromContext(c.Context())
-	l.Info("Validating ClickHouse instance", "name", c.Name())
+	l.Info("Validating Kafka instance", "name", c.Name())
 
 	engine, ok := c.Instance().Spec.Components[common.ComponentEngine]
 	if !ok {
@@ -84,185 +85,99 @@ func (p *Provider) Validate(c *controller.Context) error {
 	}
 
 	if c.Instance().GetTopologyType() == common.TopologyReplicated {
-		if engine.Replicas != nil && *engine.Replicas < 2 {
-			return fmt.Errorf("replicated topology requires at least 2 engine replicas")
+		if engine.Replicas != nil && *engine.Replicas < 3 {
+			return fmt.Errorf("replicated topology requires at least 3 brokers for Raft quorum")
 		}
 	}
 
 	return nil
 }
 
-// Sync creates and polls the required resources for the selected topology.
+// Sync creates or waits on the Kafka CR for the selected topology.
 //
-// Create-only semantics: once created, the Altinity operator owns the CHI/CHK
-// and we must not overwrite its changes on every reconcile. WaitError is
-// returned while provisioning is in progress so the runtime requeues after 15s.
+// Create-only semantics: once created, Strimzi owns the Kafka CR and we must
+// not overwrite its changes on every reconcile. WaitError is returned while
+// provisioning is in progress so the runtime requeues after 15s.
 func (p *Provider) Sync(c *controller.Context) error {
 	l := log.FromContext(c.Context())
 	topology := c.Instance().GetTopologyType()
-	l.Info("Syncing ClickHouse instance", "name", c.Name(), "topology", topology)
+	l.Info("Syncing Kafka instance", "name", c.Name(), "topology", topology)
 
-	switch topology {
-	case common.TopologyReplicated:
-		return p.syncReplicated(c)
-	default:
-		// standalone (and any unknown topology falls through to standalone)
-		return p.syncStandalone(c)
-	}
-}
-
-// syncStandalone creates or waits on the CHI for a single-node deployment.
-func (p *Provider) syncStandalone(c *controller.Context) error {
-	l := log.FromContext(c.Context())
-
-	existing := &chiv1.ClickHouseInstallation{}
+	existing := &kafkav1beta2.Kafka{}
 	if err := c.Get(existing, c.Name()); err != nil {
-		chi, buildErr := buildCHI(c, 1)
+		replicas := brokerReplicas(c)
+		kafka, buildErr := buildKafka(c, replicas)
 		if buildErr != nil {
-			return fmt.Errorf("build ClickHouseInstallation: %w", buildErr)
+			return fmt.Errorf("build Kafka CR: %w", buildErr)
 		}
-		if applyErr := c.Apply(chi); applyErr != nil {
-			return fmt.Errorf("create ClickHouseInstallation: %w", applyErr)
+		if applyErr := c.Apply(kafka); applyErr != nil {
+			return fmt.Errorf("create Kafka CR: %w", applyErr)
 		}
-		l.Info("ClickHouseInstallation created", "name", c.Name())
-		return controller.WaitForDuration("waiting for Altinity operator to provision ClickHouseInstallation", 15*time.Second)
+		l.Info("Kafka CR created", "name", c.Name(), "brokers", replicas)
+		return controller.WaitForDuration("waiting for Strimzi operator to provision Kafka cluster", 15*time.Second)
 	}
 
-	return waitForCHI(c, existing)
+	return waitForKafka(c, existing)
 }
 
-// syncReplicated creates or waits on a CHK (Keeper) + CHI pair.
-func (p *Provider) syncReplicated(c *controller.Context) error {
-	l := log.FromContext(c.Context())
-	keeperName := keeperCRName(c.Name())
-
-	// 1. Ensure Keeper exists.
-	existingCHK := &chkv1.ClickHouseKeeperInstallation{}
-	if err := c.Get(existingCHK, keeperName); err != nil {
-		chk := buildCHK(c)
-		if applyErr := c.Apply(chk); applyErr != nil {
-			return fmt.Errorf("create ClickHouseKeeperInstallation: %w", applyErr)
-		}
-		l.Info("ClickHouseKeeperInstallation created", "name", keeperName)
-		return controller.WaitForDuration("waiting for Keeper to initialize", 15*time.Second)
-	}
-
-	// 2. Wait for Keeper to be ready before creating ClickHouse.
-	if keeperErr := waitForCHK(c, existingCHK); keeperErr != nil {
-		return keeperErr
-	}
-
-	// 3. Ensure ClickHouse exists.
-	replicas := replicasCount(c)
-	existingCHI := &chiv1.ClickHouseInstallation{}
-	if err := c.Get(existingCHI, c.Name()); err != nil {
-		chi, buildErr := buildCHI(c, replicas)
-		if buildErr != nil {
-			return fmt.Errorf("build ClickHouseInstallation: %w", buildErr)
-		}
-		if applyErr := c.Apply(chi); applyErr != nil {
-			return fmt.Errorf("create ClickHouseInstallation: %w", applyErr)
-		}
-		l.Info("ClickHouseInstallation created (replicated)", "name", c.Name(), "replicas", replicas)
-		return controller.WaitForDuration("waiting for Altinity operator to provision ClickHouseInstallation", 15*time.Second)
-	}
-
-	return waitForCHI(c, existingCHI)
-}
-
-// waitForCHI checks CHI status and returns a WaitError if not yet Completed.
-func waitForCHI(c *controller.Context, chi *chiv1.ClickHouseInstallation) error {
+// waitForKafka checks the Kafka CR status and returns a WaitError if not yet ready.
+func waitForKafka(c *controller.Context, kafka *kafkav1beta2.Kafka) error {
 	l := log.FromContext(c.Context())
 
-	if chi.Status == nil {
-		return controller.WaitForDuration("waiting for Altinity operator to initialize CHI", 15*time.Second)
+	if kafka.Status == nil {
+		return controller.WaitForDuration("waiting for Strimzi operator to initialize Kafka", 15*time.Second)
 	}
-	switch chi.Status.GetStatus() {
-	case chiv1.StatusCompleted:
-		l.Info("ClickHouseInstallation is Completed", "name", chi.Name)
+
+	ready, msg := kafkaReadyCondition(kafka)
+	if ready {
+		l.Info("Kafka cluster is Ready", "name", kafka.Name)
 		return nil
-	case chiv1.StatusAborted:
-		return fmt.Errorf("ClickHouseInstallation aborted: %s", chi.Status.GetError())
-	default:
-		l.Info("ClickHouseInstallation still provisioning", "name", chi.Name, "status", chi.Status.GetStatus())
-		return controller.WaitForDuration("waiting for Altinity operator to complete CHI provisioning", 15*time.Second)
 	}
+
+	l.Info("Kafka cluster still provisioning", "name", kafka.Name, "message", msg)
+	return controller.WaitForDuration(
+		fmt.Sprintf("waiting for Strimzi operator to complete Kafka provisioning: %s", msg),
+		15*time.Second,
+	)
 }
 
-// waitForCHK checks CHK status and returns a WaitError if not yet Completed.
-func waitForCHK(c *controller.Context, chk *chkv1.ClickHouseKeeperInstallation) error {
-	l := log.FromContext(c.Context())
-
-	if chk.Status == nil {
-		return controller.WaitForDuration("waiting for Keeper to initialize", 15*time.Second)
-	}
-	switch chk.Status.GetStatus() {
-	case chkv1.StatusCompleted:
-		l.Info("ClickHouseKeeperInstallation is Completed", "name", chk.Name)
-		return nil
-	case chkv1.StatusAborted:
-		return fmt.Errorf("ClickHouseKeeperInstallation aborted: %s", chk.Status.GetError())
-	default:
-		l.Info("Keeper still provisioning", "name", chk.Name, "status", chk.Status.GetStatus())
-		return controller.WaitForDuration("waiting for Keeper to complete provisioning", 15*time.Second)
-	}
-}
-
-// Status reports the current status of the ClickHouse instance.
+// Status reports the current status of the Kafka instance.
 func (p *Provider) Status(c *controller.Context) (controller.Status, error) {
-	topology := c.Instance().GetTopologyType()
-
-	if topology == common.TopologyReplicated {
-		// For replicated, check Keeper first, then CHI.
-		chk := &chkv1.ClickHouseKeeperInstallation{}
-		if err := c.Get(chk, keeperCRName(c.Name())); err != nil {
-			return controller.Provisioning("Waiting for ClickHouseKeeperInstallation"), nil
-		}
-		if chk.Status == nil || chk.Status.GetStatus() != chkv1.StatusCompleted {
-			return controller.Provisioning("Waiting for Keeper to become ready"), nil
-		}
+	kafka := &kafkav1beta2.Kafka{}
+	if err := c.Get(kafka, c.Name()); err != nil {
+		return controller.Provisioning("Waiting for Kafka CR"), nil
 	}
-
-	chi := &chiv1.ClickHouseInstallation{}
-	if err := c.Get(chi, c.Name()); err != nil {
-		return controller.Provisioning("Waiting for ClickHouseInstallation"), nil
-	}
-	if chi.Status == nil {
+	if kafka.Status == nil {
 		return controller.Provisioning("Waiting for operator to initialize"), nil
 	}
 
-	switch chi.Status.GetStatus() {
-	case chiv1.StatusCompleted:
-		return controller.ReadyWithConnectionDetails(buildConnectionDetails(c, chi)), nil
-	case chiv1.StatusAborted:
-		errMsg := chi.Status.GetError()
+	ready, msg := kafkaReadyCondition(kafka)
+	if ready {
+		return controller.ReadyWithConnectionDetails(buildConnectionDetails(c)), nil
+	}
+
+	if isKafkaFailed(kafka) {
+		errMsg := msg
 		if errMsg == "" {
-			errMsg = "ClickHouseInstallation aborted"
+			errMsg = "Kafka cluster failed"
 		}
 		return controller.Failed(errMsg), nil
-	default:
-		return controller.Provisioning(fmt.Sprintf("Cluster is being created (%s)", chi.Status.GetStatus())), nil
 	}
+
+	return controller.Provisioning(fmt.Sprintf("Cluster is being created: %s", msg)), nil
 }
 
-// Cleanup removes the CHI (and CHK for replicated) when the Instance is deleted.
+// Cleanup removes the Kafka CR when the Instance is deleted.
 func (p *Provider) Cleanup(c *controller.Context) error {
 	l := log.FromContext(c.Context())
-	l.Info("Cleaning up ClickHouse instance", "name", c.Name())
+	l.Info("Cleaning up Kafka instance", "name", c.Name())
 
-	chi := &chiv1.ClickHouseInstallation{ObjectMeta: c.ObjectMeta(c.Name())}
-	if err := c.Delete(chi); err != nil {
-		return fmt.Errorf("delete ClickHouseInstallation: %w", err)
+	kafka := &kafkav1beta2.Kafka{ObjectMeta: c.ObjectMeta(c.Name())}
+	if err := c.Delete(kafka); err != nil {
+		return fmt.Errorf("delete Kafka CR: %w", err)
 	}
 
-	if c.Instance().GetTopologyType() == common.TopologyReplicated {
-		chk := &chkv1.ClickHouseKeeperInstallation{ObjectMeta: c.ObjectMeta(keeperCRName(c.Name()))}
-		if err := c.Delete(chk); err != nil {
-			return fmt.Errorf("delete ClickHouseKeeperInstallation: %w", err)
-		}
-	}
-
-	l.Info("ClickHouse instance cleaned up", "name", c.Name())
+	l.Info("Kafka instance cleaned up", "name", c.Name())
 	return nil
 }
 
@@ -270,128 +185,175 @@ func (p *Provider) Cleanup(c *controller.Context) error {
 // Builders
 // =============================================================================
 
-// buildCHI constructs a ClickHouseInstallation for the given replica count.
-func buildCHI(c *controller.Context, replicasCount int) (*chiv1.ClickHouseInstallation, error) {
+// buildKafka constructs a Strimzi Kafka CR configured for KRaft mode.
+func buildKafka(c *controller.Context, replicas int) (*kafkav1beta2.Kafka, error) {
 	engine := c.Instance().Spec.Components[common.ComponentEngine]
 	image, err := resolveImage(c, engine)
 	if err != nil {
 		return nil, err
 	}
+	kafkaVersion := extractKafkaVersion(image)
+	metadataVersion := resolveMetadataVersion(image)
 	cpu, memory := resolveResources(engine)
 	storageSize, storageClass := resolveStorage(engine)
+	kafkaConfig := buildKafkaConfig(replicas)
 
-	container := corev1.Container{
-		Name:  "clickhouse",
-		Image: image,
-		Resources: corev1.ResourceRequirements{
-			Limits:   corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
-			Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
+	replicaCount := int32(replicas) //nolint:gosec
+	volID := int32(0)
+	deleteClaim := false
+	storageSizeStr := storageSize.String()
+
+	// Plain (non-TLS) and TLS internal listeners.
+	listenerType := kafkav1beta2.KafkaSpecKafkaListenersElemType("internal")
+	listeners := []kafkav1beta2.KafkaSpecKafkaListenersElem{
+		{Name: "plain", Port: 9092, Type: listenerType, Tls: false},
+		{Name: "tls", Port: 9093, Type: listenerType, Tls: true},
+	}
+
+	// JBOD storage with a single persistent volume.
+	storageVolume := kafkav1beta2.KafkaSpecKafkaStorageVolumesElem{
+		Id:          &volID,
+		Type:        kafkav1beta2.KafkaSpecKafkaStorageVolumesElemType("persistent-claim"),
+		Size:        &storageSizeStr,
+		DeleteClaim: &deleteClaim,
+		Class:       storageClass,
+	}
+	storage := &kafkav1beta2.KafkaSpecKafkaStorage{
+		Type:    kafkav1beta2.KafkaSpecKafkaStorageType("jbod"),
+		Volumes: []kafkav1beta2.KafkaSpecKafkaStorageVolumesElem{storageVolume},
+	}
+
+	// Resources as apiextensions JSON (Strimzi uses freeform resource maps).
+	resources := buildResourcesJSON(cpu, memory)
+
+	kafka := &kafkav1beta2.Kafka{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.Name(),
+			Namespace: c.Namespace(),
+			Annotations: map[string]string{
+				// Enable KRaft mode — no ZooKeeper required.
+				"strimzi.io/kraft":      "enabled",
+				"strimzi.io/node-pools": "enabled",
+			},
+		},
+		Spec: &kafkav1beta2.KafkaSpec{
+			Kafka: kafkav1beta2.KafkaSpecKafka{
+				Version:         &kafkaVersion,
+				MetadataVersion: &metadataVersion,
+				Image:           &image,
+				Replicas:        &replicaCount,
+				Listeners:       listeners,
+				Config:          kafkaConfig,
+				Storage:         storage,
+				Resources:       resources,
+			},
+			EntityOperator: &kafkav1beta2.KafkaSpecEntityOperator{
+				TopicOperator: &kafkav1beta2.KafkaSpecEntityOperatorTopicOperator{},
+				UserOperator:  &kafkav1beta2.KafkaSpecEntityOperatorUserOperator{},
+			},
 		},
 	}
 
-	pvcSpec := corev1.PersistentVolumeClaimSpec{
-		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-		Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageSize}},
-	}
-	if storageClass != nil {
-		pvcSpec.StorageClassName = storageClass
-	}
-
-	cluster := &chiv1.Cluster{
-		Name: common.CHIClusterName,
-		Layout: &chiv1.ChiClusterLayout{
-			ShardsCount:   1,
-			ReplicasCount: replicasCount,
-		},
-		Templates: &chiv1.TemplatesList{
-			PodTemplate:             common.PodTemplateName,
-			DataVolumeClaimTemplate: common.DataVolumeClaimTemplateName,
-		},
-	}
-
-	spec := chiv1.ChiSpec{
-		Configuration: &chiv1.Configuration{
-			Clusters: []*chiv1.Cluster{cluster},
-		},
-		Templates: &chiv1.Templates{
-			PodTemplates:         []chiv1.PodTemplate{{Name: common.PodTemplateName, Spec: corev1.PodSpec{Containers: []corev1.Container{container}}}},
-			VolumeClaimTemplates: []chiv1.VolumeClaimTemplate{{Name: common.DataVolumeClaimTemplateName, Spec: pvcSpec}},
-		},
-	}
-
-	// Wire Keeper for replicated topology using explicit node listing.
-	// The Altinity operator creates per-replica headless services following:
-	//   chk-<keeper-name>-<cluster>-0-<replica-index>.<namespace>.svc
-	// We enumerate them for the ZooKeeper config so older operator versions
-	// (which may not support the keeper: reference field) work correctly.
-	if replicasCount > 1 {
-		nodes := keeperZookeeperNodes(keeperCRName(c.Name()), c.Namespace(), common.KeeperReplicas)
-		spec.Configuration.Zookeeper = &chiv1.ZookeeperConfig{
-			Nodes:              nodes,
-			SessionTimeoutMs:   30000,
-			OperationTimeoutMs: 10000,
-		}
-	}
-
-	return &chiv1.ClickHouseInstallation{
-		ObjectMeta: c.ObjectMeta(c.Name()),
-		Spec:       spec,
-	}, nil
+	return kafka, nil
 }
 
-// buildCHK constructs a ClickHouseKeeperInstallation with 3 replicas (Raft quorum).
-func buildCHK(c *controller.Context) *chkv1.ClickHouseKeeperInstallation {
-	// Keeper nodes are small — fixed resources, not user-configurable.
-	keeperCPU := resource.MustParse("500m")
-	keeperMem := resource.MustParse("1Gi")
-	keeperStorage := resource.MustParse("10Gi")
-
-	container := corev1.Container{
-		Name:  "clickhouse-keeper",
-		Image: "clickhouse/clickhouse-keeper:25.3.5",
-		Resources: corev1.ResourceRequirements{
-			Limits:   corev1.ResourceList{corev1.ResourceCPU: keeperCPU, corev1.ResourceMemory: keeperMem},
-			Requests: corev1.ResourceList{corev1.ResourceCPU: keeperCPU, corev1.ResourceMemory: keeperMem},
-		},
+// buildKafkaConfig returns Kafka broker config scaled to the replica count.
+// Replication factors are capped at 3 even if more brokers are requested.
+func buildKafkaConfig(replicas int) *apiextensionsv1.JSON {
+	rf := replicas
+	if rf > 3 {
+		rf = 3
+	}
+	minISR := rf - 1
+	if minISR < 1 {
+		minISR = 1
 	}
 
-	return &chkv1.ClickHouseKeeperInstallation{
-		ObjectMeta: c.ObjectMeta(keeperCRName(c.Name())),
-		Spec: chkv1.ChkSpec{
-			Configuration: &chkv1.Configuration{
-				Clusters: []*chkv1.Cluster{
-					{
-						Name: common.CHKClusterName,
-						Layout: &chkv1.ChkClusterLayout{
-							ReplicasCount: common.KeeperReplicas,
-						},
-						Templates: &chiv1.TemplatesList{
-							PodTemplate:             common.KeeperPodTemplateName,
-							DataVolumeClaimTemplate: common.KeeperDataVolumeClaimTemplateName,
-						},
-					},
-				},
-			},
-			Templates: &chiv1.Templates{
-				PodTemplates: []chiv1.PodTemplate{
-					{
-						Name: common.KeeperPodTemplateName,
-						Spec: corev1.PodSpec{Containers: []corev1.Container{container}},
-					},
-				},
-				VolumeClaimTemplates: []chiv1.VolumeClaimTemplate{
-					{
-						Name: common.KeeperDataVolumeClaimTemplateName,
-						Spec: corev1.PersistentVolumeClaimSpec{
-							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-							Resources: corev1.VolumeResourceRequirements{
-								Requests: corev1.ResourceList{corev1.ResourceStorage: keeperStorage},
-							},
-						},
-					},
-				},
-			},
-		},
+	cfg := map[string]string{
+		"offsets.topic.replication.factor":         fmt.Sprintf("%d", rf),
+		"transaction.state.log.replication.factor": fmt.Sprintf("%d", rf),
+		"transaction.state.log.min.isr":            fmt.Sprintf("%d", minISR),
+		"default.replication.factor":               fmt.Sprintf("%d", rf),
+		"min.insync.replicas":                      fmt.Sprintf("%d", minISR),
+	}
+
+	raw, _ := json.Marshal(cfg)
+	return &apiextensionsv1.JSON{Raw: raw}
+}
+
+// buildResourcesJSON serialises CPU/memory into the freeform JSON format
+// that Strimzi's KafkaSpecKafkaResources expects.
+func buildResourcesJSON(cpu, memory resource.Quantity) *kafkav1beta2.KafkaSpecKafkaResources {
+	cpuStr := cpu.String()
+	memStr := memory.String()
+
+	reqRaw, _ := json.Marshal(map[string]string{"cpu": cpuStr, "memory": memStr})
+	limRaw, _ := json.Marshal(map[string]string{"cpu": cpuStr, "memory": memStr})
+
+	return &kafkav1beta2.KafkaSpecKafkaResources{
+		Requests: &apiextensionsv1.JSON{Raw: reqRaw},
+		Limits:   &apiextensionsv1.JSON{Raw: limRaw},
+	}
+}
+
+// =============================================================================
+// Status helpers
+// =============================================================================
+
+// kafkaReadyCondition inspects the Kafka status conditions for the Ready condition.
+// Returns (true, "") when ready, or (false, message) when not.
+func kafkaReadyCondition(kafka *kafkav1beta2.Kafka) (bool, string) {
+	if kafka.Status == nil {
+		return false, "waiting for status"
+	}
+	for _, cond := range kafka.Status.Conditions {
+		if cond.Type == nil || *cond.Type != "Ready" {
+			continue
+		}
+		if cond.Status != nil && *cond.Status == "True" {
+			return true, ""
+		}
+		msg := ""
+		if cond.Message != nil {
+			msg = *cond.Message
+		}
+		return false, msg
+	}
+	return false, "Ready condition not yet reported"
+}
+
+// isKafkaFailed returns true if the Ready condition is False with an Error reason.
+func isKafkaFailed(kafka *kafkav1beta2.Kafka) bool {
+	if kafka.Status == nil {
+		return false
+	}
+	for _, cond := range kafka.Status.Conditions {
+		if cond.Type == nil || cond.Status == nil {
+			continue
+		}
+		if *cond.Type == "Ready" && *cond.Status == "False" {
+			if cond.Reason != nil && strings.Contains(*cond.Reason, "Error") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// =============================================================================
+// Connection details
+// =============================================================================
+
+// buildConnectionDetails returns the Kafka bootstrap endpoint.
+// Strimzi naming convention: <instance>-kafka-bootstrap.<namespace>.svc
+func buildConnectionDetails(c *controller.Context) controller.ConnectionDetails {
+	host := fmt.Sprintf("%s-kafka-bootstrap.%s.svc", c.Name(), c.Namespace())
+	return controller.ConnectionDetails{
+		Type:     "kafka",
+		Provider: common.ProviderName,
+		Host:     host,
+		Port:     common.BootstrapPort,
+		URI:      fmt.Sprintf("%s:%s", host, common.BootstrapPort),
 	}
 }
 
@@ -399,34 +361,16 @@ func buildCHK(c *controller.Context) *chkv1.ClickHouseKeeperInstallation {
 // Helpers
 // =============================================================================
 
-// keeperCRName returns the CHK resource name for a given instance.
-func keeperCRName(instanceName string) string {
-	return instanceName + "-keeper"
-}
-
-// keeperZookeeperNodes builds the explicit ZooKeeper node list for Keeper.
-// Altinity creates per-replica headless services:
-//
-//	chk-<keeper-name>-<cluster>-0-<replica>.<namespace>.svc
-//
-// Port 2181 is the standard ZooKeeper/Keeper client port.
-func keeperZookeeperNodes(keeperName, namespace string, replicas int) []chiv1.ZookeeperNode {
-	nodes := make([]chiv1.ZookeeperNode, replicas)
-	for i := 0; i < replicas; i++ {
-		// Service name pattern: chk-<keeper-name>-<cluster>-<shard>-<replica>
-		svc := fmt.Sprintf("chk-%s-%s-0-%d.%s.svc", keeperName, common.CHKClusterName, i, namespace)
-		nodes[i] = chiv1.NewZookeeperNode(svc, 2181)
-	}
-	return nodes
-}
-
-// replicasCount returns the configured replica count or the default.
-func replicasCount(c *controller.Context) int {
+// brokerReplicas returns the configured replica count or the topology default.
+func brokerReplicas(c *controller.Context) int {
 	engine := c.Instance().Spec.Components[common.ComponentEngine]
-	if engine.Replicas != nil && *engine.Replicas >= 2 {
+	if engine.Replicas != nil && *engine.Replicas > 0 {
 		return int(*engine.Replicas)
 	}
-	return common.DefaultReplicasCount
+	if c.Instance().GetTopologyType() == common.TopologyReplicated {
+		return common.DefaultReplicatedReplicas
+	}
+	return common.DefaultStandaloneReplicas
 }
 
 // resolveImage returns the container image for the engine component.
@@ -449,10 +393,38 @@ func resolveImage(c *controller.Context, engine corev1alpha1.ComponentSpec) (str
 	return "", fmt.Errorf("no image found for engine component")
 }
 
+// extractKafkaVersion parses the Kafka version from a Strimzi image tag.
+// e.g. "quay.io/strimzi/kafka:0.44.0-kafka-3.9.0" → "3.9.0"
+func extractKafkaVersion(image string) string {
+	parts := strings.Split(image, "-kafka-")
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	// Fallback: use the image tag after the last colon.
+	if idx := strings.LastIndex(image, ":"); idx >= 0 {
+		return image[idx+1:]
+	}
+	return "3.9.0"
+}
+
+// resolveMetadataVersion derives the KRaft metadata version from the image tag.
+func resolveMetadataVersion(image string) string {
+	switch {
+	case strings.Contains(image, "3.9"):
+		return common.KafkaMetadataVersion3_9
+	case strings.Contains(image, "3.8"):
+		return common.KafkaMetadataVersion3_8
+	case strings.Contains(image, "3.7"):
+		return common.KafkaMetadataVersion3_7
+	default:
+		return common.DefaultMetadataVersion
+	}
+}
+
 // resolveResources returns CPU and memory quantities with defaults applied.
 func resolveResources(engine corev1alpha1.ComponentSpec) (cpu, memory resource.Quantity) {
 	cpu = resource.MustParse("1")
-	memory = resource.MustParse("4Gi")
+	memory = resource.MustParse("2Gi")
 	if engine.Resources == nil || engine.Resources.Limits == nil {
 		return
 	}
@@ -467,7 +439,7 @@ func resolveResources(engine corev1alpha1.ComponentSpec) (cpu, memory resource.Q
 
 // resolveStorage returns the storage size and optional storage class.
 func resolveStorage(engine corev1alpha1.ComponentSpec) (size resource.Quantity, storageClass *string) {
-	size = resource.MustParse("25Gi")
+	size = resource.MustParse("10Gi")
 	if engine.Storage == nil {
 		return
 	}
@@ -476,20 +448,4 @@ func resolveStorage(engine corev1alpha1.ComponentSpec) (size resource.Quantity, 
 	}
 	storageClass = engine.Storage.StorageClass
 	return
-}
-
-// buildConnectionDetails extracts connection info from a ready CHI.
-func buildConnectionDetails(c *controller.Context, chi *chiv1.ClickHouseInstallation) controller.ConnectionDetails {
-	svcName := fmt.Sprintf("clickhouse-%s", c.Name())
-	host := chi.Status.GetEndpoint()
-	if host == "" {
-		host = fmt.Sprintf("%s.%s.svc", svcName, c.Namespace())
-	}
-	return controller.ConnectionDetails{
-		Type:     "clickhouse",
-		Provider: common.ProviderName,
-		Host:     host,
-		Port:     "8123",
-		URI:      fmt.Sprintf("http://default:@%s:8123/", host),
-	}
 }
