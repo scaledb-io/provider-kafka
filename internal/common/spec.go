@@ -12,13 +12,34 @@ const (
 	// ComponentTypeClickHouse is the component type name, matching versions.yaml.
 	ComponentTypeClickHouse = "clickhouse"
 
+	// TopologyStandalone is the single-node topology name.
+	TopologyStandalone = "standalone"
+
+	// TopologyReplicated is the replicated topology name (requires ClickHouse Keeper).
+	TopologyReplicated = "replicated"
+
 	// CHIClusterName is the cluster name used inside the ClickHouseInstallation CR.
 	// Altinity uses this as part of the pod and service naming scheme.
 	CHIClusterName = "clickhouse"
 
+	// CHKClusterName is the cluster name used inside the ClickHouseKeeperInstallation CR.
+	CHKClusterName = "keeper"
+
+	// KeeperReplicas is the number of Keeper nodes — must be odd for Raft quorum.
+	KeeperReplicas = 3
+
+	// DefaultReplicasCount is the default number of ClickHouse replicas for the replicated topology.
+	DefaultReplicasCount = 2
+
 	// PodTemplateName is the name of the pod template defined in the CHI spec.
 	PodTemplateName = "default"
 
+	// KeeperPodTemplateName is the name of the pod template for Keeper nodes.
+	KeeperPodTemplateName = "keeper-default"
+
 	// DataVolumeClaimTemplateName is the name of the volume claim template for data storage.
 	DataVolumeClaimTemplateName = "data"
+
+	// KeeperDataVolumeClaimTemplateName is the name of the volume claim template for Keeper storage.
+	KeeperDataVolumeClaimTemplateName = "keeper-data"
 )

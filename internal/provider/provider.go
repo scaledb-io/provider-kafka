@@ -16,8 +16,10 @@ package provider
 
 import (
 	"fmt"
+	"time"
 
 	chiv1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	chkv1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,7 +31,7 @@ import (
 	"github.com/scaledb-io/provider-clickhouse/internal/common"
 )
 
-// Compile-time check that Provider implements the required interface.
+// Compile-time check.
 var _ controller.ProviderInterface = (*Provider)(nil)
 
 // Provider implements controller.ProviderInterface for ClickHouse via the Altinity operator.
@@ -44,10 +46,15 @@ func New() *Provider {
 			ProviderName: common.ProviderName,
 			SchemeFuncs: []func(*runtime.Scheme) error{
 				chiv1.AddToScheme,
+				chkv1.AddToScheme,
 			},
-			WatchConfigs: []controller.WatchConfig{
-				controller.WatchOwned(&chiv1.ClickHouseInstallation{}),
-			},
+			// NOTE: We intentionally do NOT watch CHI/CHK here.
+			// Watching them causes a tight feedback loop: operator updates
+			// (finalizers, status) re-trigger Apply, which updates the object,
+			// which triggers the operator again.
+			// Instead, Status() polls via c.Get() on each Instance reconcile,
+			// and Sync() returns WaitError while provisioning is in progress.
+			WatchConfigs: []controller.WatchConfig{},
 		},
 	}
 }
@@ -76,42 +83,157 @@ func (p *Provider) Validate(c *controller.Context) error {
 		}
 	}
 
+	if c.Instance().GetTopologyType() == common.TopologyReplicated {
+		if engine.Replicas != nil && *engine.Replicas < 2 {
+			return fmt.Errorf("replicated topology requires at least 2 engine replicas")
+		}
+	}
+
 	return nil
 }
 
-// Sync creates or updates the ClickHouseInstallation resource.
+// Sync creates and polls the required resources for the selected topology.
+//
+// Create-only semantics: once created, the Altinity operator owns the CHI/CHK
+// and we must not overwrite its changes on every reconcile. WaitError is
+// returned while provisioning is in progress so the runtime requeues after 15s.
 func (p *Provider) Sync(c *controller.Context) error {
 	l := log.FromContext(c.Context())
-	l.Info("Syncing ClickHouse instance", "name", c.Name())
+	topology := c.Instance().GetTopologyType()
+	l.Info("Syncing ClickHouse instance", "name", c.Name(), "topology", topology)
 
-	chi, err := buildCHI(c)
-	if err != nil {
-		return fmt.Errorf("build ClickHouseInstallation: %w", err)
+	switch topology {
+	case common.TopologyReplicated:
+		return p.syncReplicated(c)
+	default:
+		// standalone (and any unknown topology falls through to standalone)
+		return p.syncStandalone(c)
+	}
+}
+
+// syncStandalone creates or waits on the CHI for a single-node deployment.
+func (p *Provider) syncStandalone(c *controller.Context) error {
+	l := log.FromContext(c.Context())
+
+	existing := &chiv1.ClickHouseInstallation{}
+	if err := c.Get(existing, c.Name()); err != nil {
+		chi, buildErr := buildCHI(c, 1)
+		if buildErr != nil {
+			return fmt.Errorf("build ClickHouseInstallation: %w", buildErr)
+		}
+		if applyErr := c.Apply(chi); applyErr != nil {
+			return fmt.Errorf("create ClickHouseInstallation: %w", applyErr)
+		}
+		l.Info("ClickHouseInstallation created", "name", c.Name())
+		return controller.WaitForDuration("waiting for Altinity operator to provision ClickHouseInstallation", 15*time.Second)
 	}
 
-	if err := c.Apply(chi); err != nil {
-		return fmt.Errorf("apply ClickHouseInstallation: %w", err)
+	return waitForCHI(c, existing)
+}
+
+// syncReplicated creates or waits on a CHK (Keeper) + CHI pair.
+func (p *Provider) syncReplicated(c *controller.Context) error {
+	l := log.FromContext(c.Context())
+	keeperName := keeperCRName(c.Name())
+
+	// 1. Ensure Keeper exists.
+	existingCHK := &chkv1.ClickHouseKeeperInstallation{}
+	if err := c.Get(existingCHK, keeperName); err != nil {
+		chk := buildCHK(c)
+		if applyErr := c.Apply(chk); applyErr != nil {
+			return fmt.Errorf("create ClickHouseKeeperInstallation: %w", applyErr)
+		}
+		l.Info("ClickHouseKeeperInstallation created", "name", keeperName)
+		return controller.WaitForDuration("waiting for Keeper to initialize", 15*time.Second)
 	}
 
-	l.Info("ClickHouse instance synced", "name", c.Name())
-	return nil
+	// 2. Wait for Keeper to be ready before creating ClickHouse.
+	if keeperErr := waitForCHK(c, existingCHK); keeperErr != nil {
+		return keeperErr
+	}
+
+	// 3. Ensure ClickHouse exists.
+	replicas := replicasCount(c)
+	existingCHI := &chiv1.ClickHouseInstallation{}
+	if err := c.Get(existingCHI, c.Name()); err != nil {
+		chi, buildErr := buildCHI(c, replicas)
+		if buildErr != nil {
+			return fmt.Errorf("build ClickHouseInstallation: %w", buildErr)
+		}
+		if applyErr := c.Apply(chi); applyErr != nil {
+			return fmt.Errorf("create ClickHouseInstallation: %w", applyErr)
+		}
+		l.Info("ClickHouseInstallation created (replicated)", "name", c.Name(), "replicas", replicas)
+		return controller.WaitForDuration("waiting for Altinity operator to provision ClickHouseInstallation", 15*time.Second)
+	}
+
+	return waitForCHI(c, existingCHI)
+}
+
+// waitForCHI checks CHI status and returns a WaitError if not yet Completed.
+func waitForCHI(c *controller.Context, chi *chiv1.ClickHouseInstallation) error {
+	l := log.FromContext(c.Context())
+
+	if chi.Status == nil {
+		return controller.WaitForDuration("waiting for Altinity operator to initialize CHI", 15*time.Second)
+	}
+	switch chi.Status.GetStatus() {
+	case chiv1.StatusCompleted:
+		l.Info("ClickHouseInstallation is Completed", "name", chi.Name)
+		return nil
+	case chiv1.StatusAborted:
+		return fmt.Errorf("ClickHouseInstallation aborted: %s", chi.Status.GetError())
+	default:
+		l.Info("ClickHouseInstallation still provisioning", "name", chi.Name, "status", chi.Status.GetStatus())
+		return controller.WaitForDuration("waiting for Altinity operator to complete CHI provisioning", 15*time.Second)
+	}
+}
+
+// waitForCHK checks CHK status and returns a WaitError if not yet Completed.
+func waitForCHK(c *controller.Context, chk *chkv1.ClickHouseKeeperInstallation) error {
+	l := log.FromContext(c.Context())
+
+	if chk.Status == nil {
+		return controller.WaitForDuration("waiting for Keeper to initialize", 15*time.Second)
+	}
+	switch chk.Status.GetStatus() {
+	case chkv1.StatusCompleted:
+		l.Info("ClickHouseKeeperInstallation is Completed", "name", chk.Name)
+		return nil
+	case chkv1.StatusAborted:
+		return fmt.Errorf("ClickHouseKeeperInstallation aborted: %s", chk.Status.GetError())
+	default:
+		l.Info("Keeper still provisioning", "name", chk.Name, "status", chk.Status.GetStatus())
+		return controller.WaitForDuration("waiting for Keeper to complete provisioning", 15*time.Second)
+	}
 }
 
 // Status reports the current status of the ClickHouse instance.
 func (p *Provider) Status(c *controller.Context) (controller.Status, error) {
+	topology := c.Instance().GetTopologyType()
+
+	if topology == common.TopologyReplicated {
+		// For replicated, check Keeper first, then CHI.
+		chk := &chkv1.ClickHouseKeeperInstallation{}
+		if err := c.Get(chk, keeperCRName(c.Name())); err != nil {
+			return controller.Provisioning("Waiting for ClickHouseKeeperInstallation"), nil
+		}
+		if chk.Status == nil || chk.Status.GetStatus() != chkv1.StatusCompleted {
+			return controller.Provisioning("Waiting for Keeper to become ready"), nil
+		}
+	}
+
 	chi := &chiv1.ClickHouseInstallation{}
 	if err := c.Get(chi, c.Name()); err != nil {
 		return controller.Provisioning("Waiting for ClickHouseInstallation"), nil
 	}
-
 	if chi.Status == nil {
 		return controller.Provisioning("Waiting for operator to initialize"), nil
 	}
 
 	switch chi.Status.GetStatus() {
 	case chiv1.StatusCompleted:
-		details := buildConnectionDetails(c, chi)
-		return controller.ReadyWithConnectionDetails(details), nil
+		return controller.ReadyWithConnectionDetails(buildConnectionDetails(c, chi)), nil
 	case chiv1.StatusAborted:
 		errMsg := chi.Status.GetError()
 		if errMsg == "" {
@@ -119,90 +241,67 @@ func (p *Provider) Status(c *controller.Context) (controller.Status, error) {
 		}
 		return controller.Failed(errMsg), nil
 	default:
-		// InProgress, Terminating, or empty — still provisioning
 		return controller.Provisioning(fmt.Sprintf("Cluster is being created (%s)", chi.Status.GetStatus())), nil
 	}
 }
 
-// Cleanup removes the ClickHouseInstallation when the Instance is deleted.
+// Cleanup removes the CHI (and CHK for replicated) when the Instance is deleted.
 func (p *Provider) Cleanup(c *controller.Context) error {
 	l := log.FromContext(c.Context())
 	l.Info("Cleaning up ClickHouse instance", "name", c.Name())
 
-	chi := &chiv1.ClickHouseInstallation{
-		ObjectMeta: c.ObjectMeta(c.Name()),
-	}
+	chi := &chiv1.ClickHouseInstallation{ObjectMeta: c.ObjectMeta(c.Name())}
 	if err := c.Delete(chi); err != nil {
 		return fmt.Errorf("delete ClickHouseInstallation: %w", err)
+	}
+
+	if c.Instance().GetTopologyType() == common.TopologyReplicated {
+		chk := &chkv1.ClickHouseKeeperInstallation{ObjectMeta: c.ObjectMeta(keeperCRName(c.Name()))}
+		if err := c.Delete(chk); err != nil {
+			return fmt.Errorf("delete ClickHouseKeeperInstallation: %w", err)
+		}
 	}
 
 	l.Info("ClickHouse instance cleaned up", "name", c.Name())
 	return nil
 }
 
-// buildCHI constructs a ClickHouseInstallation from the Instance spec.
-func buildCHI(c *controller.Context) (*chiv1.ClickHouseInstallation, error) {
-	engine := c.Instance().Spec.Components[common.ComponentEngine]
+// =============================================================================
+// Builders
+// =============================================================================
 
-	// Resolve the container image: explicit override > version bundle > default.
+// buildCHI constructs a ClickHouseInstallation for the given replica count.
+func buildCHI(c *controller.Context, replicasCount int) (*chiv1.ClickHouseInstallation, error) {
+	engine := c.Instance().Spec.Components[common.ComponentEngine]
 	image, err := resolveImage(c, engine)
 	if err != nil {
 		return nil, err
 	}
-
-	// Resolve resource limits with defaults.
 	cpu, memory := resolveResources(engine)
-
-	// Resolve data storage size and optional storage class.
 	storageSize, storageClass := resolveStorage(engine)
 
-	// Build the pod template.
 	container := corev1.Container{
 		Name:  "clickhouse",
 		Image: image,
 		Resources: corev1.ResourceRequirements{
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    cpu,
-				corev1.ResourceMemory: memory,
-			},
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    cpu,
-				corev1.ResourceMemory: memory,
-			},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
+			Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
 		},
 	}
 
-	podTemplate := chiv1.PodTemplate{
-		Name: common.PodTemplateName,
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{container},
-		},
-	}
-
-	// Build the volume claim template.
 	pvcSpec := corev1.PersistentVolumeClaimSpec{
 		AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-		Resources: corev1.VolumeResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceStorage: storageSize,
-			},
-		},
+		Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: storageSize}},
 	}
 	if storageClass != nil {
 		pvcSpec.StorageClassName = storageClass
 	}
 
-	vct := chiv1.VolumeClaimTemplate{
-		Name: common.DataVolumeClaimTemplateName,
-		Spec: pvcSpec,
-	}
-
-	// Build the CHI cluster layout (standalone: 1 shard, 1 replica).
 	cluster := &chiv1.Cluster{
 		Name: common.CHIClusterName,
 		Layout: &chiv1.ChiClusterLayout{
 			ShardsCount:   1,
-			ReplicasCount: 1,
+			ReplicasCount: replicasCount,
 		},
 		Templates: &chiv1.TemplatesList{
 			PodTemplate:             common.PodTemplateName,
@@ -210,20 +309,124 @@ func buildCHI(c *controller.Context) (*chiv1.ClickHouseInstallation, error) {
 		},
 	}
 
-	chi := &chiv1.ClickHouseInstallation{
-		ObjectMeta: c.ObjectMeta(c.Name()),
-		Spec: chiv1.ChiSpec{
-			Configuration: &chiv1.Configuration{
-				Clusters: []*chiv1.Cluster{cluster},
-			},
-			Templates: &chiv1.Templates{
-				PodTemplates:         []chiv1.PodTemplate{podTemplate},
-				VolumeClaimTemplates: []chiv1.VolumeClaimTemplate{vct},
-			},
+	spec := chiv1.ChiSpec{
+		Configuration: &chiv1.Configuration{
+			Clusters: []*chiv1.Cluster{cluster},
+		},
+		Templates: &chiv1.Templates{
+			PodTemplates:         []chiv1.PodTemplate{{Name: common.PodTemplateName, Spec: corev1.PodSpec{Containers: []corev1.Container{container}}}},
+			VolumeClaimTemplates: []chiv1.VolumeClaimTemplate{{Name: common.DataVolumeClaimTemplateName, Spec: pvcSpec}},
 		},
 	}
 
-	return chi, nil
+	// Wire Keeper for replicated topology using explicit node listing.
+	// The Altinity operator creates per-replica headless services following:
+	//   chk-<keeper-name>-<cluster>-0-<replica-index>.<namespace>.svc
+	// We enumerate them for the ZooKeeper config so older operator versions
+	// (which may not support the keeper: reference field) work correctly.
+	if replicasCount > 1 {
+		nodes := keeperZookeeperNodes(keeperCRName(c.Name()), c.Namespace(), common.KeeperReplicas)
+		spec.Configuration.Zookeeper = &chiv1.ZookeeperConfig{
+			Nodes:              nodes,
+			SessionTimeoutMs:   30000,
+			OperationTimeoutMs: 10000,
+		}
+	}
+
+	return &chiv1.ClickHouseInstallation{
+		ObjectMeta: c.ObjectMeta(c.Name()),
+		Spec:       spec,
+	}, nil
+}
+
+// buildCHK constructs a ClickHouseKeeperInstallation with 3 replicas (Raft quorum).
+func buildCHK(c *controller.Context) *chkv1.ClickHouseKeeperInstallation {
+	// Keeper nodes are small — fixed resources, not user-configurable.
+	keeperCPU := resource.MustParse("500m")
+	keeperMem := resource.MustParse("1Gi")
+	keeperStorage := resource.MustParse("10Gi")
+
+	container := corev1.Container{
+		Name:  "clickhouse-keeper",
+		Image: "clickhouse/clickhouse-keeper:25.3.5",
+		Resources: corev1.ResourceRequirements{
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: keeperCPU, corev1.ResourceMemory: keeperMem},
+			Requests: corev1.ResourceList{corev1.ResourceCPU: keeperCPU, corev1.ResourceMemory: keeperMem},
+		},
+	}
+
+	return &chkv1.ClickHouseKeeperInstallation{
+		ObjectMeta: c.ObjectMeta(keeperCRName(c.Name())),
+		Spec: chkv1.ChkSpec{
+			Configuration: &chkv1.Configuration{
+				Clusters: []*chkv1.Cluster{
+					{
+						Name: common.CHKClusterName,
+						Layout: &chkv1.ChkClusterLayout{
+							ReplicasCount: common.KeeperReplicas,
+						},
+						Templates: &chiv1.TemplatesList{
+							PodTemplate:             common.KeeperPodTemplateName,
+							DataVolumeClaimTemplate: common.KeeperDataVolumeClaimTemplateName,
+						},
+					},
+				},
+			},
+			Templates: &chiv1.Templates{
+				PodTemplates: []chiv1.PodTemplate{
+					{
+						Name: common.KeeperPodTemplateName,
+						Spec: corev1.PodSpec{Containers: []corev1.Container{container}},
+					},
+				},
+				VolumeClaimTemplates: []chiv1.VolumeClaimTemplate{
+					{
+						Name: common.KeeperDataVolumeClaimTemplateName,
+						Spec: corev1.PersistentVolumeClaimSpec{
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Resources: corev1.VolumeResourceRequirements{
+								Requests: corev1.ResourceList{corev1.ResourceStorage: keeperStorage},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+// keeperCRName returns the CHK resource name for a given instance.
+func keeperCRName(instanceName string) string {
+	return instanceName + "-keeper"
+}
+
+// keeperZookeeperNodes builds the explicit ZooKeeper node list for Keeper.
+// Altinity creates per-replica headless services:
+//
+//	chk-<keeper-name>-<cluster>-0-<replica>.<namespace>.svc
+//
+// Port 2181 is the standard ZooKeeper/Keeper client port.
+func keeperZookeeperNodes(keeperName, namespace string, replicas int) []chiv1.ZookeeperNode {
+	nodes := make([]chiv1.ZookeeperNode, replicas)
+	for i := 0; i < replicas; i++ {
+		// Service name pattern: chk-<keeper-name>-<cluster>-<shard>-<replica>
+		svc := fmt.Sprintf("chk-%s-%s-0-%d.%s.svc", keeperName, common.CHKClusterName, i, namespace)
+		nodes[i] = chiv1.NewZookeeperNode(svc, 2181)
+	}
+	return nodes
+}
+
+// replicasCount returns the configured replica count or the default.
+func replicasCount(c *controller.Context) int {
+	engine := c.Instance().Spec.Components[common.ComponentEngine]
+	if engine.Replicas != nil && *engine.Replicas >= 2 {
+		return int(*engine.Replicas)
+	}
+	return common.DefaultReplicasCount
 }
 
 // resolveImage returns the container image for the engine component.
@@ -231,31 +434,25 @@ func resolveImage(c *controller.Context, engine corev1alpha1.ComponentSpec) (str
 	if engine.Image != "" {
 		return engine.Image, nil
 	}
-
 	spec, err := c.ProviderSpec()
 	if err != nil {
 		return "", fmt.Errorf("get provider spec: %w", err)
 	}
-
 	if engine.Version != "" {
-		img := controller.GetImageForVersion(spec, common.ComponentEngine, engine.Version)
-		if img != "" {
+		if img := controller.GetImageForVersion(spec, common.ComponentEngine, engine.Version); img != "" {
 			return img, nil
 		}
 	}
-
-	img := controller.GetDefaultImageForComponent(spec, common.ComponentEngine)
-	if img == "" {
-		return "", fmt.Errorf("no image found for engine component")
+	if img := controller.GetDefaultImageForComponent(spec, common.ComponentEngine); img != "" {
+		return img, nil
 	}
-	return img, nil
+	return "", fmt.Errorf("no image found for engine component")
 }
 
 // resolveResources returns CPU and memory quantities with defaults applied.
 func resolveResources(engine corev1alpha1.ComponentSpec) (cpu, memory resource.Quantity) {
 	cpu = resource.MustParse("1")
 	memory = resource.MustParse("4Gi")
-
 	if engine.Resources == nil || engine.Resources.Limits == nil {
 		return
 	}
@@ -268,10 +465,9 @@ func resolveResources(engine corev1alpha1.ComponentSpec) (cpu, memory resource.Q
 	return
 }
 
-// resolveStorage returns the storage size and optional storage class from the engine spec.
+// resolveStorage returns the storage size and optional storage class.
 func resolveStorage(engine corev1alpha1.ComponentSpec) (size resource.Quantity, storageClass *string) {
 	size = resource.MustParse("25Gi")
-
 	if engine.Storage == nil {
 		return
 	}
@@ -283,24 +479,17 @@ func resolveStorage(engine corev1alpha1.ComponentSpec) (size resource.Quantity, 
 }
 
 // buildConnectionDetails extracts connection info from a ready CHI.
-// Altinity creates a load-balancer service named: chi-<name>-<cluster>
 func buildConnectionDetails(c *controller.Context, chi *chiv1.ClickHouseInstallation) controller.ConnectionDetails {
-	// Altinity LB service naming: chi-<name>-<clusterName>
-	svcName := fmt.Sprintf("chi-%s-%s", c.Name(), common.CHIClusterName)
-
-	// Prefer the status endpoint if already resolved by the operator.
+	svcName := fmt.Sprintf("clickhouse-%s", c.Name())
 	host := chi.Status.GetEndpoint()
 	if host == "" {
 		host = fmt.Sprintf("%s.%s.svc", svcName, c.Namespace())
 	}
-
-	const httpPort = "8123"
-
 	return controller.ConnectionDetails{
 		Type:     "clickhouse",
 		Provider: common.ProviderName,
 		Host:     host,
-		Port:     httpPort,
-		URI:      fmt.Sprintf("http://default:@%s:%s/", host, httpPort),
+		Port:     "8123",
+		URI:      fmt.Sprintf("http://default:@%s:8123/", host),
 	}
 }

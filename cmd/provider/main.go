@@ -24,6 +24,8 @@ func main() {
 			Port:           8082,
 			ValidationPath: "/validate",
 		}),
+		// Bind metrics to a non-conflicting port (8080 is taken by OpenEverest v1).
+		reconciler.WithMetrics(":9091"),
 	)
 	if err != nil {
 		l.Error(err, "unable to create reconciler")
