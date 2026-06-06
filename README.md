@@ -44,11 +44,11 @@ make helm-install
 
 ## Supported Versions
 
-| Kafka Version | Strimzi Image | Default |
-|--------------|---------------|---------|
-| 3.9.0 | `quay.io/strimzi/kafka:0.44.0-kafka-3.9.0` | ✅ |
-| 3.8.1 | `quay.io/strimzi/kafka:0.44.0-kafka-3.8.1` | |
-| 3.7.2 | `quay.io/strimzi/kafka:0.44.0-kafka-3.7.2` | |
+| Kafka Version | Strimzi Image | Default | Notes |
+|--------------|---------------|---------|-------|
+| 4.0.0 | `quay.io/strimzi/kafka:0.47.0-kafka-4.0.0` | ✅ | ZooKeeper removed — KRaft only |
+| 3.9.1 | `quay.io/strimzi/kafka:0.47.0-kafka-3.9.1` | | |
+| 3.8.1 | `quay.io/strimzi/kafka:0.45.0-kafka-3.8.1` | | |
 
 ---
 

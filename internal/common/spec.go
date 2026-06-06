@@ -32,15 +32,16 @@ const (
 	// BootstrapPort is the plain (non-TLS) Kafka client port exposed by Strimzi.
 	BootstrapPort = "9092"
 
+	// KafkaMetadataVersion4_0 is the KRaft metadata version for Kafka 4.0.x.
+	// Kafka 4.0 removes ZooKeeper entirely — KRaft is the only supported mode.
+	KafkaMetadataVersion4_0 = "4.0-IV3"
+
 	// KafkaMetadataVersion3_9 is the KRaft metadata version for Kafka 3.9.x.
 	KafkaMetadataVersion3_9 = "3.9-IV0"
 
 	// KafkaMetadataVersion3_8 is the KRaft metadata version for Kafka 3.8.x.
 	KafkaMetadataVersion3_8 = "3.8-IV0"
 
-	// KafkaMetadataVersion3_7 is the KRaft metadata version for Kafka 3.7.x.
-	KafkaMetadataVersion3_7 = "3.7-IV4"
-
 	// DefaultMetadataVersion is used when the version-specific value is not resolved.
-	DefaultMetadataVersion = KafkaMetadataVersion3_9
+	DefaultMetadataVersion = KafkaMetadataVersion4_0
 )
